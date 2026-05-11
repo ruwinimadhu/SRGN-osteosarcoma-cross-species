@@ -1,0 +1,483 @@
+# SRGN Expression Analysis in Canine Osteosarcoma
+# A Cross-Species Transcriptomic Study
+# Author: Ruwini
+# Date: 2026-05-11
+
+---
+title: "SRGN Expression in Canine Osteosarcoma: A Cross-Species Transcriptomic Analysis"
+author: "Ruwini"
+date: "`r Sys.Date()`"
+output:
+  github_document:
+    toc: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width  = 10,
+  fig.height = 7,
+  dpi     = 300
+)
+```
+
+## Overview
+
+This analysis investigates the role of **SRGN (Serglycin)** in canine osteosarcoma (OSA)
+using a four-layer computational approach:
+
+1. **Layer 1** — Single-cell RNA-seq cell-type expression (GSE252470, 6 dogs)
+2. **Layer 2** — Bulk RNA-seq TME correlation (DOG2 cohort, 198 dogs)  
+3. **Layer 3** — Survival analysis (DOG2 clinical + GSE39055 human OSA)
+4. **Layer 4** — Upstream TF regulon analysis (DoRothEA/VIPER)
+
+---
+
+## Setup
+
+```{r libraries}
+library(Seurat)
+library(ggplot2)
+library(ggpubr)
+library(dplyr)
+library(survival)
+library(survminer)
+library(readxl)
+library(readr)
+library(dorothea)
+library(viper)
+library(Matrix)
+library(GEOquery)
+```
+
+```{r working-directory}
+# Set to your local path
+setwd("C:/Users/user/OneDrive/Desktop/GSE252470")
+```
+
+---
+
+## Layer 1: Single-Cell RNA-seq Analysis (GSE252470)
+
+### 1.1 Load Raw 10x Genomics Data
+
+Each sample requires three files: `barcodes.tsv`, `features.tsv`, `matrix.mtx`
+organised in per-sample subfolders.
+
+```{r load-scrna, eval=FALSE}
+sample_ids <- c("N1_1", "N1_2", "N2_1", "N2_2", "N3", "N4", "N5", "N6")
+
+# Load all 8 samples using ReadMtx (handles uncompressed files)
+seurat_list <- lapply(sample_ids, function(sid) {
+  counts <- ReadMtx(
+    mtx      = file.path(sid, "matrix.mtx"),
+    cells    = file.path(sid, "barcodes.tsv"),
+    features = file.path(sid, "features.tsv")
+  )
+  CreateSeuratObject(counts,
+                     project      = sid,
+                     min.cells    = 3,
+                     min.features = 200)
+})
+names(seurat_list) <- sample_ids
+
+# Merge all samples
+merged <- merge(seurat_list[[1]],
+                y            = seurat_list[-1],
+                add.cell.ids = sample_ids)
+```
+
+### 1.2 Quality Control
+
+Three QC metrics are calculated per cell:
+- `nFeature_RNA`: number of detected genes (low = empty droplet, high = doublet)
+- `nCount_RNA`: total RNA molecules (extreme values = doublets)
+- `percent.mt`: mitochondrial gene percentage (high = dying cell)
+
+```{r qc, eval=FALSE}
+merged[["percent.mt"]] <- PercentageFeatureSet(merged, pattern = "^MT-")
+
+# Visualise QC metrics
+VlnPlot(merged,
+        features = c("nFeature_RNA", "nCount_RNA", "percent.mt"),
+        ncol     = 3,
+        pt.size  = 0)
+
+# Filter low quality cells
+merged_filtered <- subset(merged,
+                           subset = nFeature_RNA > 200  &
+                                    nFeature_RNA < 6000 &
+                                    nCount_RNA   < 50000 &
+                                    percent.mt   < 25)
+
+cat("Cells after QC:", ncol(merged_filtered), "\n")
+# Result: 47,078 cells retained from 57,685 raw cells
+```
+
+### 1.3 Seurat Preprocessing Pipeline
+
+```{r preprocessing, eval=FALSE}
+merged_filtered <- merged_filtered %>%
+  NormalizeData() %>%
+  FindVariableFeatures(nfeatures = 3000) %>%
+  ScaleData() %>%
+  RunPCA(npcs = 30) %>%
+  FindNeighbors(dims = 1:20) %>%
+  FindClusters(resolution = 0.5) %>%
+  RunUMAP(dims = 1:20)
+```
+
+### 1.4 Cell Type Annotation
+
+Clusters were annotated using canonical marker genes:
+
+| Marker | Cell Type |
+|--------|-----------|
+| CD3E | T cells |
+| CD79A | B cells |
+| CD68, LYZ | Macrophages |
+| CTSK, ACP5 | Osteoclasts |
+| FAP, DCN | CAFs |
+| PECAM1 | Endothelial |
+| RUNX2, SPP1 | Osteoblasts/Tumor |
+
+```{r annotation, eval=FALSE}
+# Load pre-processed annotated object
+merged_filtered <- readRDS("GSE252470_annotated.rds")
+
+# Visualise cell type marker expression
+DotPlot(merged_filtered,
+        features  = c("PTPRC", "CD3E", "CD79A",
+                       "CD68", "LYZ", "CTSK", "ACP5",
+                       "FAP", "DCN", "PECAM1",
+                       "RUNX2", "SPP1", "SRGN"),
+        group.by  = "seurat_clusters",
+        cols      = c("lightgrey", "darkred"),
+        dot.scale = 6) +
+  RotatedAxis() +
+  scale_y_discrete(expand = expansion(add = 1.5)) +
+  ggtitle("Cell type markers by cluster") +
+  xlab("") + ylab("Cluster")
+```
+
+### 1.5 SRGN Expression by Cell Type
+
+```{r srgn-umap, eval=FALSE}
+# SRGN on UMAP
+FeaturePlot(merged_filtered,
+            features = "SRGN",
+            cols     = c("lightgrey", "red"),
+            pt.size  = 0.3) +
+  ggtitle("SRGN expression across all cells")
+```
+
+```{r srgn-violin, eval=FALSE}
+# SRGN by annotated cell type
+VlnPlot(merged_filtered,
+        features = "SRGN",
+        group.by = "cell_type",
+        pt.size  = 0,
+        cols     = c("#E69F00", "#56B4E9", "#009E73",
+                     "#F0E442", "#0072B2", "#FF6B00",
+                     "#CC79A7", "#999999")) +
+  ggtitle("SRGN expression by cell type in canine OSA") +
+  xlab("") + ylab("Normalized expression") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+### 1.6 Statistical Test: Osteoclast vs Tumor SRGN Enrichment
+
+```{r srgn-stats, eval=FALSE}
+merged_filtered <- JoinLayers(merged_filtered)
+
+# Osteoclasts
+osteo_cells <- subset(merged_filtered, cell_type == "Osteoclast")
+srgn_osteo  <- FetchData(osteo_cells, vars = "SRGN", layer = "counts")
+
+# Tumor cells
+tumor_cells <- subset(merged_filtered, cell_type == "Tumor")
+srgn_tumor  <- FetchData(tumor_cells, vars = "SRGN", layer = "counts")
+
+cat("Osteoclast SRGN+:", round(mean(srgn_osteo$SRGN > 0) * 100, 2), "%\n")
+cat("Tumor SRGN+:", round(mean(srgn_tumor$SRGN > 0) * 100, 2), "%\n")
+# Result: 72.89% osteoclasts vs 17.88% tumor cells
+
+# Chi-square test
+contingency <- matrix(
+  c(sum(srgn_osteo$SRGN > 0), sum(srgn_osteo$SRGN == 0),
+    sum(srgn_tumor$SRGN > 0), sum(srgn_tumor$SRGN == 0)),
+  nrow = 2,
+  dimnames = list(c("SRGN+", "SRGN-"), c("Osteoclast", "Tumor"))
+)
+chisq.test(contingency)
+# Result: chi-sq = 5399.9, p < 2.2e-16
+```
+
+---
+
+## Layer 2: Bulk RNA-seq Correlation (DOG2 Cohort)
+
+### 2.1 Load DOG2 Bulk RNA-seq Data
+
+Data source: GSE238110 — 198 canine OSA bulk RNA-seq samples (COTC021/022 trial)
+
+```{r load-dog2, eval=FALSE}
+dog2 <- read.csv("GSE238110_RawCountFile_combined.csv",
+                 row.names    = 1,
+                 check.names  = FALSE)
+
+# Confirm SRGN detected
+grep("SRGN", rownames(dog2), ignore.case = TRUE, value = TRUE)
+# Result: "SRGN_3"
+```
+
+### 2.2 SRGN Correlation with Osteoclast Markers
+
+```{r dog2-correlation, eval=FALSE}
+# Extract log2 expression for key genes
+df_cor <- data.frame(
+  SRGN = log2(as.numeric(dog2["SRGN_3", ]) + 1),
+  CTSK = log2(as.numeric(dog2["CTSK_3", ]) + 1),
+  ACP5 = log2(as.numeric(dog2["ACP5_3", ]) + 1),
+  MMP9 = log2(as.numeric(dog2["MMP9_3", ]) + 1),
+  CD68 = log2(as.numeric(dog2["CD68_3", ]) + 1)
+)
+
+# Spearman correlations
+cor.test(df_cor$SRGN, df_cor$CTSK, method = "spearman")
+# Result: R = 0.22, p = 0.0019
+
+cor.test(df_cor$SRGN, df_cor$CD68, method = "spearman")
+# Result: R = 0.23, p = 0.0013
+
+# Four-panel correlation plot
+p1 <- ggplot(df_cor, aes(x = SRGN, y = CTSK)) +
+  geom_point(alpha = 0.5, colour = "steelblue") +
+  geom_smooth(method = "lm", colour = "red", se = TRUE) +
+  stat_cor(method = "spearman") +
+  theme_bw() + labs(title = "SRGN vs CTSK", x = "SRGN (log2)", y = "CTSK (log2)")
+
+p2 <- ggplot(df_cor, aes(x = SRGN, y = ACP5)) +
+  geom_point(alpha = 0.5, colour = "darkorange") +
+  geom_smooth(method = "lm", colour = "red", se = TRUE) +
+  stat_cor(method = "spearman") +
+  theme_bw() + labs(title = "SRGN vs ACP5", x = "SRGN (log2)", y = "ACP5 (log2)")
+
+p3 <- ggplot(df_cor, aes(x = SRGN, y = MMP9)) +
+  geom_point(alpha = 0.5, colour = "darkgreen") +
+  geom_smooth(method = "lm", colour = "red", se = TRUE) +
+  stat_cor(method = "spearman") +
+  theme_bw() + labs(title = "SRGN vs MMP9", x = "SRGN (log2)", y = "MMP9 (log2)")
+
+p4 <- ggplot(df_cor, aes(x = SRGN, y = CD68)) +
+  geom_point(alpha = 0.5, colour = "purple") +
+  geom_smooth(method = "lm", colour = "red", se = TRUE) +
+  stat_cor(method = "spearman") +
+  theme_bw() + labs(title = "SRGN vs CD68", x = "SRGN (log2)", y = "CD68 (log2)")
+
+ggarrange(p1, p2, p3, p4, ncol = 2, nrow = 2)
+```
+
+---
+
+## Layer 3: Survival Analysis
+
+### 3.1 Canine OSA Survival (DOG2 Clinical Data)
+
+```{r canine-survival, eval=FALSE}
+# Load clinical metadata
+clin <- read_excel("COTC022 SOC Data Set.xlsx")
+
+# Calculate survival days from surgery dates
+clin$OS_days   <- as.numeric(difftime(clin$`Date off study`,
+                                       clin$`Date of Surgery`,
+                                       units = "days"))
+clin$OS_status <- as.numeric(clin$`Cause of death (OSA, Unknown, Other)` == "OSA")
+
+# Match patient IDs between RNA-seq and clinical data
+rna_ids <- sapply(colnames(dog2), function(x) strsplit(x, "_")[[1]][2])
+common_ids <- intersect(rna_ids, clin$`Patient ID`)
+cat("Matched samples:", length(common_ids), "\n")
+# Result: 97 samples matched
+
+# Extract SRGN expression for matched samples
+srgn_matched <- log2(as.numeric(
+  dog2["SRGN_3", names(rna_ids[rna_ids %in% common_ids])]) + 1)
+names(srgn_matched) <- rna_ids[rna_ids %in% common_ids]
+
+clin_matched <- clin[match(names(srgn_matched), clin$`Patient ID`), ]
+
+# Build survival dataframe
+surv_df <- data.frame(
+  OS_days    = clin_matched$OS_days,
+  OS_status  = clin_matched$OS_status,
+  SRGN_expr  = srgn_matched,
+  SRGN_group = ifelse(srgn_matched >= median(srgn_matched),
+                      "SRGN High", "SRGN Low")
+)
+
+# Kaplan-Meier plot
+fit <- survfit(Surv(OS_days, OS_status) ~ SRGN_group, data = surv_df)
+ggsurvplot(fit,
+           data         = surv_df,
+           pval         = TRUE,
+           risk.table   = TRUE,
+           palette      = c("#E41A1C", "#377EB8"),
+           title        = "SRGN expression and OS in canine OSA (n=97)")
+# Result: p = 0.94 — no significant association
+# Interpretation: SRGN is mechanistic, not prognostic in bulk OSA
+```
+
+### 3.2 Human OSA Recurrence Analysis (GSE39055)
+
+```{r human-survival, eval=FALSE}
+# Load GSE39055 series matrix
+gse39    <- getGEO(filename = "GSE39055_series_matrix.txt.gz")
+expr39   <- exprs(gse39)
+pheno39  <- pData(gse39)
+
+# Get SRGN probe IDs from GPL14951
+gpl39       <- getGEO(annotation(gse39))
+gpl39_table <- Table(gpl39)
+srgn_probes <- gpl39_table[gpl39_table$Symbol == "SRGN", "ID"]
+# Result: ILMN_1760347, ILMN_2169152
+
+# Average expression across both probes
+srgn_expr39 <- colMeans(expr39[rownames(expr39) %in% srgn_probes, ])
+
+# Build survival dataframe
+surv_human <- data.frame(
+  time_months = as.numeric(pheno39$`time until first recurrence or latest follow-up (months):ch1`),
+  recurrence  = as.numeric(pheno39$`recurrence:ch1` == "Y"),
+  SRGN        = srgn_expr39,
+  SRGN_group  = ifelse(srgn_expr39 >= median(srgn_expr39), "SRGN High", "SRGN Low")
+)
+
+# Kaplan-Meier
+fit_human <- survfit(Surv(time_months, recurrence) ~ SRGN_group, data = surv_human)
+ggsurvplot(fit_human,
+           data       = surv_human,
+           pval       = TRUE,
+           risk.table = TRUE,
+           palette    = c("#E41A1C", "#377EB8"),
+           title      = "SRGN expression and recurrence in human OSA - GSE39055 (n=37)")
+# Result: p = 0.72 — consistent with canine finding
+```
+
+---
+
+## Layer 4: Transcription Factor Regulon Analysis (DoRothEA/VIPER)
+
+### 4.1 Run VIPER on Osteoclast Cells
+
+```{r viper-analysis, eval=FALSE}
+# Load high-confidence DoRothEA regulons (human, conserved in dog)
+data(dorothea_hs, package = "dorothea")
+regulons     <- dorothea_hs %>% filter(confidence %in% c("A", "B"))
+regulon_list <- df2regulon(regulons)
+
+# Extract osteoclast expression matrix
+merged_filtered <- JoinLayers(merged_filtered)
+osteo_cells     <- colnames(merged_filtered)[merged_filtered$cell_type == "Osteoclast"]
+expr_matrix     <- GetAssayData(merged_filtered, layer = "data")
+expr_dense      <- as.matrix(expr_matrix[, osteo_cells])
+
+# Free memory before VIPER
+rm(expr_matrix); gc()
+
+# Run VIPER — infers TF activity per osteoclast cell
+tf_activity <- viper(eset    = expr_dense,
+                     regulon = regulon_list,
+                     minsize = 4,
+                     method  = "scale",
+                     verbose = FALSE)
+# Result: 117 TFs x 4,047 osteoclast cells
+```
+
+### 4.2 Identify TFs Enriched in SRGN-High Osteoclasts
+
+```{r tf-enrichment, eval=FALSE}
+# Split osteoclasts by SRGN expression
+srgn_osteo  <- as.numeric(expr_dense["SRGN", ])
+srgn_group  <- ifelse(srgn_osteo >= median(srgn_osteo), "SRGN_high", "SRGN_low")
+
+# Wilcoxon test for each TF
+tf_pvals  <- apply(tf_activity, 1, function(tf) {
+  wilcox.test(tf[srgn_group == "SRGN_high"],
+              tf[srgn_group == "SRGN_low"])$p.value
+})
+
+tf_effect <- apply(tf_activity, 1, function(tf) {
+  mean(tf[srgn_group == "SRGN_high"]) - mean(tf[srgn_group == "SRGN_low"])
+})
+
+tf_results <- data.frame(
+  TF     = rownames(tf_activity),
+  effect = tf_effect,
+  pval   = tf_pvals,
+  padj   = p.adjust(tf_pvals, method = "fdr")
+) %>% arrange(padj)
+
+# Top TFs in SRGN-high osteoclasts
+head(tf_results %>% filter(effect > 0), 10)
+```
+
+### 4.3 Volcano Plot of TF Activity
+
+```{r tf-volcano, eval=FALSE}
+library(ggrepel)
+
+tf_results$log10padj  <- -log10(tf_results$padj)
+tf_results$significant <- tf_results$padj < 0.05 & abs(tf_results$effect) > 0.5
+
+top_tfs <- c("FOSL2", "CEBPA", "STAT5B", "ETS1", "SRF", "FOXO4")
+tf_results$label <- ifelse(tf_results$TF %in% top_tfs, tf_results$TF, "")
+
+ggplot(tf_results, aes(x = effect, y = log10padj,
+                        colour = significant, label = label)) +
+  geom_point(size = 2, alpha = 0.7) +
+  geom_text_repel(size = 4, fontface = "bold", max.overlaps = 20) +
+  scale_colour_manual(values = c("grey70", "#E41A1C")) +
+  geom_vline(xintercept = c(-0.5, 0.5), linetype = "dashed", colour = "grey50") +
+  geom_hline(yintercept = -log10(0.05),  linetype = "dashed", colour = "grey50") +
+  theme_bw() +
+  theme(legend.position = "none",
+        plot.title = element_text(face = "bold")) +
+  labs(title = "TF activity in SRGN-high vs SRGN-low osteoclasts",
+       x     = "Mean difference in TF activity",
+       y     = "-log10(FDR)")
+```
+
+---
+
+## Summary of Key Findings
+
+| Analysis | n | Key Result | Statistic |
+|---|---|---|---|
+| scRNA-seq cell type | 47,078 cells | SRGN enriched in osteoclasts | χ²=5399.9, p<2.2e-16 |
+| Bulk RNA-seq correlation | 198 dogs | SRGN ~ CTSK (R=0.22) | p=0.0019 |
+| Bulk RNA-seq correlation | 198 dogs | SRGN ~ CD68 (R=0.23) | p=0.0013 |
+| Canine survival | 97 dogs | No OS association | p=0.94 |
+| Human recurrence | 37 patients | No recurrence association | p=0.72 |
+| TF regulon (VIPER) | 4,047 osteoclasts | FOSL2, CEBPA, STAT5B enriched | FDR<10⁻¹³⁰ |
+
+### Biological Interpretation
+
+SRGN defines an osteoclast-enriched stromal compartment in canine OSA.
+Its expression is driven by AP-1 (FOSL2), myeloid differentiation (CEBPA),
+and JAK/STAT (STAT5B) transcription factors — a conserved regulatory axis
+consistent with known SRGN biology in human cancers.
+SRGN does not independently predict survival in bulk RNA-seq,
+suggesting its role is mechanistic (bone destruction, ECM remodeling)
+rather than prognostic at the population level.
+
+---
+
+## Session Information
+
+```{r session-info}
+sessionInfo()
+```
